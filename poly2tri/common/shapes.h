@@ -33,6 +33,7 @@
 
 #include "dll_symbol.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <iosfwd>
@@ -327,4 +328,172 @@ inline void Triangle::IsInterior(bool b)
 /// Is this set a valid delaunay triangulation?
 P2T_DLL_SYMBOL bool IsDelaunay(const std::vector<p2t::Triangle*>&);
 
+// ---------------------------------------------------------------------------
+// Arc-length based polyline resampling
+//
+// Re-distributes points along a contour so that neighboring output points are
+// separated by a configurable arc-length distance. Input vertices whose
+// turning angle exceeds a configurable threshold are kept verbatim (corner
+// feature points). Both closed contours and open polylines are supported.
+// The routine is purely geometric: no geometric validity is assumed, so
+// self-intersecting inputs are handled as well.
+// ---------------------------------------------------------------------------
+
+struct ResampleConfig {
+  /// Target arc-length distance between neighboring output points.
+  /// Must be greater than zero, otherwise ResamplePolyline throws.
+  double spacing = 1.0;
+  /// Minimum turning angle in radians (0 means straight, pi means a reversal)
+  /// for an input vertex to be kept as an exact feature point.
+  double corner_angle_rad = 0.78539816339744830962; // pi/4
+  /// true for a closed contour (last segment wraps back to the first point),
+  /// false for an open polyline (both endpoints are always kept).
+  bool closed = true;
+};
+
+/// Re-sample @p contour by arc length.
+///
+/// The output points split the contour into gaps between "anchor" vertices
+/// (the start point, every corner feature point, and, for open polylines, the
+/// end point); each gap is subdivided into an integer number of equally long
+/// intervals so that anchors are emitted at their exact original coordinates
+/// and no duplicate points are produced.
+///
+/// @throws std::invalid_argument if spacing is zero or negative, if the
+///         corner angle is negative, or if the contour has too few distinct
+///         points / contains a zero-length segment.
+inline std::vector<Point> ResamplePolyline(const std::vector<Point>& contour_in,
+                                           const ResampleConfig& config)
+{
+  if (!(config.spacing > 0.0)) {
+    throw std::invalid_argument("p2t::ResamplePolyline: spacing must be greater than zero");
+  }
+  if (!(config.corner_angle_rad >= 0.0)) {
+    throw std::invalid_argument("p2t::ResamplePolyline: corner_angle_rad must be non-negative");
+  }
+
+  // Drop consecutive duplicate vertices (including a repeated closing vertex).
+  std::vector<Point> p;
+  p.reserve(contour_in.size());
+  for (const Point& q : contour_in) {
+    if (p.empty() || q.x != p.back().x || q.y != p.back().y) {
+      p.push_back(q);
+    }
+  }
+  // A closed contour often repeats its first vertex as the last one; the
+  // closing segment would otherwise have zero length.
+  if (config.closed && p.size() > 1 && p.front().x == p.back().x &&
+      p.front().y == p.back().y) {
+    p.pop_back();
+  }
+  const std::size_t n = p.size();
+  if (n < 2 || (config.closed && n < 3)) {
+    throw std::invalid_argument(
+      "p2t::ResamplePolyline: contour needs at least two points (three when closed)");
+  }
+
+  const std::size_t m = config.closed ? n : n - 1; // number of segments
+  auto next_index = [&](std::size_t i) -> std::size_t {
+    const std::size_t j = i + 1;
+    return (config.closed && j == n) ? 0 : j;
+  };
+
+  // Cumulative arc length: cum[k] is the arc position of vertex k; for closed
+  // contours cum[n] holds the perimeter.
+  std::vector<double> cum(m + 1, 0.0);
+  for (std::size_t k = 0; k < m; ++k) {
+    const Point d = p[next_index(k)] - p[k];
+    const double len = d.Length();
+    if (!(len > 0.0)) {
+      throw std::invalid_argument("p2t::ResamplePolyline: zero-length segment in contour");
+    }
+    cum[k + 1] = cum[k] + len;
+  }
+  const double total = cum[m];
+
+  auto is_corner = [&](std::size_t i) -> bool {
+    const std::size_t prv = (i == 0) ? (config.closed ? n - 1 : 0) : i - 1;
+    Point u = p[i] - p[prv];
+    Point v = p[next_index(i)] - p[i];
+    if (!(u.Normalize() > 0.0) || !(v.Normalize() > 0.0)) {
+      return false;
+    }
+    double c = Dot(u, v);
+    if (c < -1.0) {
+      c = -1.0;
+    } else if (c > 1.0) {
+      c = 1.0;
+    }
+    return std::acos(c) >= config.corner_angle_rad;
+  };
+
+  struct Anchor {
+    double arc;
+    Point point;
+  };
+  std::vector<Anchor> anchors;
+  anchors.push_back({cum[0], p[0]});
+  for (std::size_t i = 1; i < n; ++i) {
+    // Open contours: only interior vertices can be corners, the end point is
+    // anchored unconditionally below.
+    if (config.closed || i < n - 1) {
+      if (is_corner(i)) {
+        anchors.push_back({cum[i], p[i]});
+      }
+    }
+  }
+  if (!config.closed) {
+    anchors.push_back({cum[m], p[n - 1]});
+  }
+
+  auto point_at_arc = [&](double s) -> Point {
+    // cum is strictly increasing; find the segment containing arc position s.
+    auto it = std::upper_bound(cum.begin(), cum.end(), s);
+    std::size_t seg = static_cast<std::size_t>(it - cum.begin());
+    if (seg == 0) {
+      seg = 1;
+    }
+    if (seg > m) {
+      seg = m;
+    }
+    --seg;
+    const double len = cum[seg + 1] - cum[seg];
+    const double t = len > 0.0 ? (s - cum[seg]) / len : 0.0;
+    const Point& a = p[seg];
+    const Point b = p[next_index(seg)];
+    return Point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+  };
+
+  std::vector<Point> out;
+  out.reserve(anchors.size() + static_cast<std::size_t>(total / config.spacing) + 1);
+  out.push_back(anchors.front().point);
+
+  auto fill_gap = [&](double arc_a, double arc_b, bool emit_end) {
+    const double gap = arc_b - arc_a;
+    long steps = std::lround(gap / config.spacing);
+    if (steps < 1) {
+      steps = 1;
+    }
+    for (long j = 1; j < steps; ++j) {
+      out.push_back(point_at_arc(arc_a + gap * static_cast<double>(j) /
+                                            static_cast<double>(steps)));
+    }
+    if (emit_end) {
+      out.push_back(point_at_arc(arc_b));
+    }
+  };
+
+  for (std::size_t a = 0; a + 1 < anchors.size(); ++a) {
+    fill_gap(anchors[a].arc, anchors[a + 1].arc, true);
+    // Emit the anchor itself, so corner points survive with exact coordinates.
+    out.back() = anchors[a + 1].point;
+  }
+  if (config.closed) {
+    // Wrap-around gap from the last anchor back to the first point, which is
+    // already the first output point and must not be duplicated.
+    fill_gap(anchors.back().arc, total, false);
+  }
+  return out;
 }
+
+} // namespace p2t
